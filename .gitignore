@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+coverage.xml
+.venv/
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/terraform.tfvars
+terraform/tfplan
