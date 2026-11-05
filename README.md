@@ -9,8 +9,8 @@ Cenário de treinamento no projeto GCP `tbx-gabriel-simoes` (Lab Toolbox): VM So
 2. Estrutura do repositório
 3. App Hello World
 4. Terraform (VM SonarQube)
-5. Apply
-6. Bootstrap do SonarQube (senha, token e secrets)
+5. Apply (e problemas conhecidos)
+6. Configuração manual: Sonar, repo na org e secrets
 7. Pipeline no GitHub Actions
 8. Rodar e validar
 9. Cenário de treinamento
@@ -48,13 +48,15 @@ gcloud auth login
 gcloud auth application-default login   # o Terraform usa ADC, não o login normal do gcloud
 gcloud config set project tbx-gabriel-simoes
 sudo apt install gh jq -y
-gh auth login                           # o bootstrap usa gh para gravar os secrets
+gh auth login                           # o gh grava os secrets e fala com a API do GitHub
 terraform -version && jq --version && gh --version
 ```
 
 **Por quê:** `gcloud auth login` e ADC são credenciais separadas. Sem o `application-default`, o `terraform plan` falha com erro de credencial, mesmo com o gcloud logado.
 
-Você precisa de permissão para criar Compute, Service Account, IAM binding e bucket no projeto. Se algum `apply` falhar por org policy (IP externo proibido, shielded VM obrigatório etc.), confira as constraints do lab antes de mexer no código.
+Você precisa de permissão para criar Compute, Service Account, IAM binding, Secret Manager e bucket no projeto (por exemplo `roles/secretmanager.admin` para o secret e o binding). Se algum `apply` falhar por org policy (IP externo proibido, shielded VM obrigatório etc.) ou por `PERMISSION_DENIED`, confira as constraints e as roles do lab antes de mexer no código.
+
+**Atenção às duas identidades do GitHub:** o `git` usa a **chave SSH** e o `gh` usa um **token**. Elas podem estar em contas diferentes (por exemplo, pessoal e da empresa). Isso causa o erro `Repository not found` descrito na Etapa 6.
 
 ---
 
@@ -81,11 +83,41 @@ sonar-lab/
 ├── app/            (__init__.py, main.py)
 ├── tests/          (test_main.py)
 ├── terraform/      (versions.tf, variables.tf, main.tf, outputs.tf, terraform.tfvars, scripts/startup.sh.tpl)
-├── scripts/bootstrap-sonar.sh
 ├── Dockerfile
 ├── requirements.txt / requirements-dev.txt / pytest.ini
-└── sonar-project.properties
+├── sonar-project.properties
+├── .gitignore
+└── .gitattributes
 ```
+
+O repositório git fica na **raiz** (`sonar-lab/`), não dentro de `terraform/`.
+
+**Line endings (LF):** os arquivos precisam estar em LF. Um `startup.sh.tpl` com CRLF (comum ao editar pelo Windows) faz o script falhar na VM com `/usr/bin/env: 'bash\r': No such file or directory`. Para converter o que já existe e evitar a recorrência:
+
+```bash
+# converte para LF (ignora .venv, .git e .terraform)
+find . \( -path ./.venv -o -path ./.git -o -path ./terraform/.terraform \) -prune -o \
+  -type f \( -name '*.tf' -o -name '*.tfvars' -o -name '*.tpl' -o -name '*.sh' \
+             -o -name '*.txt' -o -name '*.ini' -o -name '*.py' -o -name '*.properties' \
+             -o -name '*.yml' -o -name '*.yaml' -o -name 'Dockerfile' -o -name '.gitignore' \) \
+  -exec sed -i 's/\r$//' {} +
+
+# confere: deve imprimir OK
+grep -rlI $'\r' --exclude-dir=.venv --exclude-dir=.terraform --exclude-dir=.git . || echo "OK: sem CRLF"
+```
+
+`.gitattributes`:
+
+```
+*.sh   text eol=lf
+*.tpl  text eol=lf
+*.tf   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+```
+
+No WSL, rode também `git config core.autocrlf input`. Se você edita pelo VS Code do Windows, force LF nas configurações (`"files.eol": "\n"`).
 
 ---
 
@@ -191,6 +223,8 @@ terraform/terraform.tfvars
 terraform/tfplan
 ```
 
+O `terraform/tfplan` precisa estar aqui porque o plano guarda a senha do Postgres. Se você tiver anotações com credenciais ou IPs na pasta (por exemplo `anotacoes.txt`), adicione também.
+
 Teste local antes de seguir:
 
 ```bash
@@ -210,6 +244,7 @@ docker build -t hello-sonar:local .
 - **IP estático:** a URL do Sonar não muda se a VM reiniciar. O `SONAR_HOST_URL` do GitHub fica estável.
 - **Firewall `:9000` (restrito por `allowed_cidrs`) e SSH só via IAP:** a porta 22 fica fechada para a internet e você entra com `--tunnel-through-iap`.
 - **Service Account própria com roles mínimas:** a VM não usa a SA default do Compute, que costuma ter Editor.
+- **Secret Manager para a senha do Postgres:** a senha não fica no metadata da VM.
 - **Startup script instalando Docker e subindo Sonar + Postgres via compose:** a VM nasce pronta, sem passo manual.
 
 `terraform/versions.tf`:
@@ -257,7 +292,7 @@ variable "region" {
 
 variable "zone" {
   type    = string
-  default = "southamerica-east1-b"
+  default = "southamerica-east1-b" # sobrescrito no terraform.tfvars; veja "Problemas conhecidos" na Etapa 5
 }
 
 variable "machine_type" {
@@ -352,7 +387,7 @@ resource "google_service_account" "vm" {
   display_name = "SonarQube lab VM"
 }
 
-# Permissões à conta de serviço da VM para escrever logs e métricas
+# Permissões à conta de serviço da VM para escrever logs
 resource "google_project_iam_member" "vm_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
@@ -374,7 +409,7 @@ resource "google_compute_network" "this" {
 }
 
 # Sub-rede para a VM do SonarQube
-# /24 sigifica que teremos 256 endereços IP disponíveis na sub-rede, o que é suficiente para uma VM de laboratório
+# /24 significa que teremos 256 endereços IP disponíveis na sub-rede, o que é suficiente para uma VM de laboratório
 resource "google_compute_subnetwork" "this" {
   name          = "${local.name}-subnet"
   region        = var.region
@@ -395,7 +430,6 @@ resource "google_compute_firewall" "sonar_http" {
     ports    = ["9000"]
   }
 }
-
 
 # Firewall para permitir tráfego SSH na porta 22 apenas do range do IAP (Identity-Aware Proxy) do Google Cloud
 resource "google_compute_firewall" "iap_ssh" {
@@ -427,7 +461,7 @@ resource "google_compute_instance" "sonarqube" {
   labels                    = local.labels
   allow_stopping_for_update = true
 
-# Define a imagem, tamanho do disco e o tipo de disco (pd-balanced).
+  # Define a imagem, tamanho do disco e o tipo de disco (pd-balanced).
   boot_disk {
     initialize_params {
       image = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
@@ -436,8 +470,8 @@ resource "google_compute_instance" "sonarqube" {
     }
   }
 
-# A interface de rede da VM é configurada para usar a sub-rede e o endereço IP estático.
-# nat_ip é necessário para que a VM tenha um IP público e possa ser acessada de fora da rede do Google Cloud.
+  # A interface de rede da VM usa a sub-rede e o endereço IP estático.
+  # nat_ip é necessário para que a VM tenha um IP público e possa ser acessada de fora da rede do Google Cloud.
   network_interface {
     subnetwork = google_compute_subnetwork.this.id
     access_config {
@@ -445,20 +479,20 @@ resource "google_compute_instance" "sonarqube" {
     }
   }
 
-# A conta de serviço da VM é configurada para ter acesso a todos os recursos do Google Cloud (cloud-platform) e é usada para autenticação e autorização.
+  # A conta de serviço da VM usa o scope cloud-platform; o que ela pode de fato fazer é limitado pelo IAM.
   service_account {
     email  = google_service_account.vm.email
     scopes = ["cloud-platform"]
   }
 
-# A configuração de instância protegida é habilitada para aumentar a segurança da VM, incluindo inicialização segura, vTPM e monitoramento de integridade.
+  # Instância protegida: inicialização segura, vTPM e monitoramento de integridade.
   shielded_instance_config {
     enable_secure_boot          = true
     enable_vtpm                 = true
     enable_integrity_monitoring = true
   }
 
-# A metadata da VM é configurada para habilitar o OS Login, que permite gerenciar o acesso SSH à VM usando contas do Google, e para executar um script de inicialização que configura o SonarQube e o PostgreSQL.
+  # OS Login para gerenciar o SSH com contas do Google, e o script de inicialização que sobe SonarQube + PostgreSQL.
   metadata = {
     enable-oslogin = "TRUE"
     startup-script = templatefile("${path.module}/scripts/startup.sh.tpl", {
@@ -468,12 +502,24 @@ resource "google_compute_instance" "sonarqube" {
     })
   }
 
-# O secret e a permissão precisam existir antes da VM bootar
+  # O secret e a permissão precisam existir antes da VM bootar
   depends_on = [
     google_project_service.compute,
     google_secret_manager_secret_version.postgres,
     google_secret_manager_secret_iam_member.vm_accessor,
   ]
+}
+```
+
+`terraform/outputs.tf`:
+
+```hcl
+output "sonar_url" {
+  value = "http://${google_compute_address.sonarqube.address}:9000"
+}
+
+output "ssh_command" {
+  value = "gcloud compute ssh ${google_compute_instance.sonarqube.name} --zone ${var.zone} --tunnel-through-iap --project ${var.project_id}"
 }
 ```
 
@@ -573,11 +619,11 @@ docker compose --env-file "$APP_DIR/.env" -f "$APP_DIR/docker-compose.yml" up -d
 
 **Por quê da imagem:** a tag `community` da imagem oficial é o Community Build, a oferta gratuita do Sonar. Para o treinamento ficar reprodutável, fixe uma tag de versão em `sonar_image` depois do primeiro deploy.
 
-**Senha:** O startup-script no metadata fica legível para qualquer identidade com compute.instances.get e aparece no Console da VM. O secret tem IAM próprio, concedido só à SA da VM, e o acesso gera audit log.
+**Senha:** o `startup-script` no metadata fica legível para qualquer identidade com `compute.instances.get` e aparece no Console da VM. O secret tem IAM próprio, concedido só à SA da VM, e o acesso gera audit log. Como a senha é gerada pelo `random_password`, o valor continua existindo no state, por isso o bucket do state tem IAM restrito e versionamento (Etapa 1).
 
 ---
 
-## Etapa 5: Apply
+## Etapa 5: Apply (e problemas conhecidos)
 
 ```bash
 cd terraform
@@ -589,78 +635,177 @@ terraform apply tfplan
 O startup script leva uns 3 a 5 minutos. Acompanhe assim:
 
 ```bash
-$(terraform output -raw ssh_command) --command 'sudo tail -f /var/log/sonar-startup.log'
-curl -s "$(terraform output -raw sonar_url)/api/system/status"   # esperado: "status":"UP"
+$(terraform output -raw ssh_command) --command 'sudo tail -f /var/log/sonar-startup.log'   # Ctrl+C para sair
 ```
 
-Se o status ficar em `STARTING` por muito tempo, entre na VM e rode `sudo docker logs sonarqube-sonarqube-1 --tail 50`. Quase sempre é `vm.max_map_count` ou falta de memória.
+Quando o log terminar com o `docker compose up -d` criando os containers `db` e `sonarqube` (o `db` fica `Healthy`), espere o Sonar ficar `UP`, o que leva mais 1 a 2 minutos:
+
+```bash
+until curl -s "$(terraform output -raw sonar_url)/api/system/status" | grep -q '"status":"UP"'; do
+  echo "aguardando..."; sleep 10
+done
+echo "Sonar UP"
+```
+
+Na primeira conexão por IAP o `gcloud` gera a chave SSH e pode pedir uma passphrase. O OS Login pode levar um minuto para propagar a permissão; se aparecer `Permission denied` ou erro 4003, espere e tente de novo.
+
+### Problemas conhecidos
+
+| Sintoma | Causa | Solução |
+|---|---|---|
+| `apply` falha com `ZONE_RESOURCE_POOL_EXHAUSTED` ("does not have enough resources") | A zona está sem capacidade para o `machine_type` | Troque `zone` no `terraform.tfvars` (por exemplo `southamerica-east1-a`) e rode `plan` + `apply` de novo; só a VM é criada, o resto já existe. Se as três zonas falharem, use outro `machine_type` (por exemplo `n2-standard-2`) ou tente mais tarde |
+| `/var/log/sonar-startup.log` não existe; a serial mostra `'bash\r': No such file or directory` | `startup.sh.tpl` com CRLF; o script morre antes de criar o log | Converta para LF (Etapa 2), `terraform apply` (altera só o metadata da VM) e rode o startup manualmente (linha abaixo) |
+| Startup script corrigido, mas nada acontece na VM | O startup script só roda no boot | `$(terraform output -raw ssh_command) --command 'sudo google_metadata_script_runner startup'` (prende o terminal por 3 a 5 minutos) |
+| Log mostra `Falha ao ler o secret` | IAM do secret ainda não propagou ou falta permissão | O script tenta 30 vezes; se persistir, confira o binding `secretAccessor` da SA da VM |
+| Sonar fica em `STARTING` ou o container reinicia em loop | `vm.max_map_count` baixo ou pouca memória | `sysctl vm.max_map_count` (deve dar `524288`) e `sudo docker logs sonarqube-sonarqube-1 --tail 50` |
+| `apply` falha com `PERMISSION_DENIED` no Secret Manager | Falta `roles/secretmanager.admin` ou equivalente | Peça a role ao admin do projeto |
+
+Para conferir o metadata que a VM recebeu (o primeiro byte deve ser `bash\n`, sem `\r`):
+
+```bash
+gcloud compute instances describe sonarqube-lab \
+  --zone southamerica-east1-a --project tbx-gabriel-simoes --format=json \
+  | jq -r '.metadata.items[] | select(.key=="startup-script") | .value' \
+  | head -1 | od -c | head -2
+```
 
 ---
 
-## Etapa 6: Bootstrap do SonarQube (senha, token e secrets do GitHub)
+## Etapa 6: Configuração manual: Sonar, repo na org e secrets
 
-**Por quê:** o Sonar sobe com `admin/admin` e a action precisa de `SONAR_TOKEN` e `SONAR_HOST_URL`. A action lê as duas variáveis do ambiente do step, vindas de secrets do GitHub. Automatizar evita copiar token à mão e deixa o lab refazível.
+**Por quê manual:** senha do admin, token e secrets são setup único e não fazem parte do que o pipeline executa. A **ordem importa**: os secrets precisam existir antes do primeiro push, porque o push dispara o pipeline.
 
-`scripts/bootstrap-sonar.sh`:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# --- variáveis ---------------------------------------------------------
-: "${SONAR_ADMIN_PASSWORD:?Defina SONAR_ADMIN_PASSWORD (nova senha do admin)}"
-: "${GH_REPO:?Defina GH_REPO no formato owner/repo}"
-TF_DIR="${TF_DIR:-terraform}"
-TOKEN_NAME="${TOKEN_NAME:-github-actions}"
-
-SONAR_URL="$(terraform -chdir="$TF_DIR" output -raw sonar_url)"
-
-# --- 1) espera o Sonar ficar UP ----------------------------------------
-echo ">> Aguardando SonarQube em ${SONAR_URL}"
-status=""
-for i in $(seq 1 60); do
-  status="$(curl -fsS "${SONAR_URL}/api/system/status" 2>/dev/null | jq -r '.status' 2>/dev/null || true)"
-  [[ "$status" == "UP" ]] && break
-  echo "   tentativa ${i}: status='${status:-sem resposta}'"
-  sleep 10
-done
-[[ "$status" == "UP" ]] || { echo "Timeout aguardando o SonarQube" >&2; exit 1; }
-
-# --- 2) troca a senha padrão (idempotente) -----------------------------
-valid="$(curl -s -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/authentication/validate" | jq -r '.valid' 2>/dev/null || true)"
-if [[ "$valid" != "true" ]]; then
-  echo ">> Trocando a senha padrão do admin"
-  curl -fsS -u admin:admin -X POST "${SONAR_URL}/api/users/change_password" \
-    --data-urlencode "login=admin" \
-    --data-urlencode "previousPassword=admin" \
-    --data-urlencode "password=${SONAR_ADMIN_PASSWORD}"
-fi
-
-# --- 3) gera token de usuário (recria se já existir) -------------------
-echo ">> Gerando token '${TOKEN_NAME}'"
-curl -s -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/user_tokens/revoke" \
-  --data-urlencode "name=${TOKEN_NAME}" >/dev/null || true
-TOKEN="$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/user_tokens/generate" \
-  --data-urlencode "name=${TOKEN_NAME}" | jq -r '.token')"
-
-# --- 4) grava os secrets no GitHub (token nunca é impresso) ------------
-echo ">> Gravando secrets em ${GH_REPO}"
-gh secret set SONAR_TOKEN    --repo "$GH_REPO" --body "$TOKEN"
-gh secret set SONAR_HOST_URL --repo "$GH_REPO" --body "$SONAR_URL"
-
-echo ">> OK. Sonar: ${SONAR_URL} (usuário: admin)"
-```
-
-Execução:
+### 6.1 Primeiro login e senha
 
 ```bash
-chmod +x scripts/bootstrap-sonar.sh
-read -rsp "Nova senha do admin Sonar: " SONAR_ADMIN_PASSWORD; export SONAR_ADMIN_PASSWORD; echo
-export GH_REPO=SEU_USUARIO/sonar-lab
-./scripts/bootstrap-sonar.sh
+cd terraform
+terraform output -raw sonar_url
 ```
 
-Usei **token de usuário** (do admin) porque ele pode criar o projeto na primeira análise. Um token de projeto só funciona depois que o projeto existe.
+Abra a URL e logue com `admin` / `admin`. O Sonar força a troca de senha no primeiro acesso. Use uma senha forte, porque a porta 9000 está aberta para a internet.
+
+### 6.2 Token do Sonar
+
+No Sonar: avatar (canto superior direito), **My Account**, **Security**, **Generate Tokens**. O token só é mostrado uma vez, então copie na hora.
+
+| Opção | Como | Quando usar |
+|---|---|---|
+| **User token** | Name `github-actions`, Type `User Token` | Mais simples. A primeira análise cria o projeto sozinha |
+| **Project Analysis Token** | Antes: **Projects, Create project, Manually**, com project key `hello-sonar-lab`. Depois gere o token do tipo `Project Analysis Token` desse projeto | Mais seguro: o token só envia análises daquele projeto |
+
+- Com o projeto manual, a project key precisa bater com `sonar.projectKey` do `sonar-project.properties`. Se divergir, a análise cria um segundo projeto ou falha.
+- Escolha a expiração do token. Se ele expirar, o scan passa a falhar com `401`; gere outro e regrave o secret `SONAR_TOKEN` (6.6).
+
+### 6.3 Repositório na org
+
+Crie manualmente em `https://github.com/organizations/SUA-ORG/repositories/new`:
+
+- **Owner:** a org (não a conta pessoal)
+- **Name:** `sonar-lab`, ou o padrão de nome da empresa
+- **Visibility:** Private
+- **Não marque** README, .gitignore nem license: o repo precisa nascer vazio para o primeiro push não conflitar.
+
+Se a org restringe a criação de repositórios, peça a criação a um admin.
+
+### 6.4 Acesso SSH ao repo da org
+
+Primeiro diagnostique de qual conta cada ferramenta fala. O `git` usa a chave SSH e o `gh` usa o token:
+
+```bash
+ssh -T git@github.com          # conta da chave SSH
+gh auth status                  # conta do gh
+gh api user/memberships/orgs/SUA-ORG --jq '{state, role}'   # state deve ser "active"
+gh repo view SUA-ORG/sonar-lab --json nameWithOwner,visibility
+```
+
+| Situação | O que significa | O que fazer |
+|---|---|---|
+| `ssh -T` e `gh` mostram a mesma conta, com acesso à org | Tudo certo | Vá direto para "Remote" abaixo, usando `git@github.com:SUA-ORG/sonar-lab.git` |
+| `ssh -T` mostra a conta pessoal e o `gh` mostra a conta da empresa | A chave SSH não tem acesso à org. O `gh repo view` funciona e o `git ls-remote` dá `Repository not found` | Crie uma chave para a conta da empresa (abaixo) |
+| `membership` dá `404` ou `state` diferente de `active` | A conta não é membro ativo da org (ou o convite está pendente) | Aceite o convite ou peça a um admin |
+| `gh repo view` não encontra o repo | O repo não existe ou o nome está diferente | Crie o repo (6.3) ou liste: `gh repo list SUA-ORG --limit 100 --json name --jq '.[].name'` |
+| Erro mencionando SAML ou SSO | A chave ou o token não estão autorizados na org | **Settings, SSH and GPG keys, Configure SSO, Authorize** (chave) e autorize o token do `gh` pelo link do erro |
+
+**Chave dedicada à conta da empresa** (uma chave SSH só pode estar em uma conta do GitHub):
+
+```bash
+# 1) gerar
+ssh-keygen -t ed25519 -C "SEU_EMAIL_DA_EMPRESA" -f ~/.ssh/id_ed25519_empresa
+
+# 2) cadastrar na conta que o gh está usando (o token precisa do escopo admin:public_key)
+gh ssh-key add ~/.ssh/id_ed25519_empresa.pub --title "WSL Gabriel (empresa)"
+
+# 3) alias no ~/.ssh/config
+cat >> ~/.ssh/config <<'EOF'
+
+Host github-empresa
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519_empresa
+  IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+
+# 4) testar: deve responder com a conta da empresa
+ssh -T git@github-empresa
+```
+
+O `IdentitiesOnly yes` impede o SSH de oferecer a chave pessoal para esse host. Se a org usa SAML SSO, autorize a chave nova na org (**Configure SSO**).
+
+**Remote** (na raiz do repo, não dentro de `terraform/`):
+
+```bash
+cd ~/toolbox_wsl/estudos/Lab_SonarQube      # ajuste para o caminho do seu repo
+git init -b main
+
+ORG_REPO="SUA-ORG/sonar-lab"
+: "${ORG_REPO:?defina ORG_REPO}"
+
+# com alias (conta da empresa): git@github-empresa:...   |   sem alias: git@github.com:...
+git remote add origin "git@github-empresa:${ORG_REPO}.git"
+git remote -v
+
+git ls-remote origin && echo "acesso OK"    # repo vazio não lista nada, mas imprime "acesso OK"
+```
+
+Se `origin` já existir, use `git remote set-url origin ...` no lugar de `git remote add`.
+
+### 6.5 Identidade dos commits
+
+Rode **um comando por linha** e só neste repo, para o commit não sair com a identidade pessoal:
+
+```bash
+git config user.name  "SEU NOME"
+git config user.email "SEU_EMAIL_DA_EMPRESA"
+git config --local --get-regexp '^user\.'
+```
+
+### 6.6 Secrets do GitHub
+
+Os nomes precisam ser exatamente `SONAR_TOKEN` e `SONAR_HOST_URL`. A URL não leva barra no final.
+
+```bash
+cd ~/toolbox_wsl/estudos/Lab_SonarQube      # raiz do repo
+ORG_REPO="SUA-ORG/sonar-lab"
+
+gh secret set SONAR_TOKEN --repo "$ORG_REPO"        # cole o token (a digitação fica oculta)
+gh secret set SONAR_HOST_URL --repo "$ORG_REPO" \
+  --body "$(terraform -chdir=terraform output -raw sonar_url)"
+gh secret list --repo "$ORG_REPO"                   # devem aparecer os dois nomes; o valor nunca é exibido
+```
+
+- **Pela web:** repo, **Settings, Secrets and variables, Actions, New repository secret**.
+- **Secret de organização:** se várias pessoas usam o mesmo Sonar, um secret na org (**Org Settings, Secrets and variables, Actions**) evita repetir, mas exige admin.
+- O `gh secret set` usa o token do `gh`, não a chave SSH. Ele também precisa estar autorizado na org (SSO).
+
+### 6.7 Liberar a action do Sonar na org
+
+Orgs costumam restringir actions de terceiros, e a `SonarSource/sonarqube-scan-action` é de terceiros. Em **Settings, Actions, General** (do repo ou da org):
+
+- *Allow all actions*: não precisa fazer nada.
+- *Allow select actions*: adicione `SonarSource/sonarqube-scan-action@*` à lista.
+
+Se estiver bloqueada, o run falha logo no início dizendo que a action não é permitida na organização.
 
 ---
 
@@ -725,24 +870,54 @@ jobs:
 - **`sonar.qualitygate.wait=true`:** o job só termina depois que o Sonar processa a análise e avalia o Quality Gate, e falha se reprovar. Sem isso o pipeline fica verde mesmo com o gate vermelho.
 - **`docker-build` depois do scan:** é o "Hello World image". Só builda se a qualidade passou. Push para o Artifact Registry fica como extensão (precisa de Workload Identity Federation, que dá outro guia).
 
-**Sobre a versão da action:** usei `@v8`, mas a release v8.0.0 (maio/2026) traz uma seção de breaking change nas release notes. Leia antes de rodar. Se algo quebrar, `@v7` é a alternativa conhecida.
+**Sobre a versão da action:** o fluxo foi validado com `@v8`. As release notes da v8.0.0 (maio/2026) têm uma seção de breaking change, então leia antes de atualizar. Se algo quebrar, `@v7` é a alternativa conhecida.
+
+**Avisos que aparecem no run (não bloqueiam):**
+
+- *Node.js 20 is deprecated*: `actions/checkout@v4` e `actions/setup-python@v5` estão sendo forçados para Node 24. Quando quiser, suba para as majors mais novas e leia as release notes.
+- *`ubuntu-latest` vai migrar para Ubuntu 26* (a partir de 19/10/2026). Para estabilidade, fixe `runs-on: ubuntu-24.04`.
 
 ---
 
 ## Etapa 8: Rodar e validar
 
+Pré-condições: secrets gravados (6.6), `.github/workflows/ci-sonar.yml` criado, action liberada na org (6.7) e `terraform/tfplan` no `.gitignore`.
+
 ```bash
-git add . && git commit -m "feat: sonar lab" && git push origin main
+cd ~/toolbox_wsl/estudos/Lab_SonarQube      # raiz do repo
+git add -n .                                # simulação: confira o que entraria
 ```
 
-1. Veja o run em **Actions** do repo: testes, scan e build devem passar.
+Não devem aparecer `.venv`, `terraform/.terraform`, `terraform/tfplan`, `terraform/terraform.tfvars` nem arquivos com credenciais. Se aparecer, ajuste o `.gitignore`.
+
+```bash
+git add .
+git status --short
+git commit -m "feat: sonar lab"
+git push -u origin main                     # vai pedir a passphrase da chave, se houver
+gh run watch --repo "$ORG_REPO"
+```
+
+1. Veja o run em **Actions** do repo: `test-and-scan` e `docker-build` devem passar.
 2. Abra `http://<IP>:9000`, logue como `admin` e confira o projeto `hello-sonar-lab` com cobertura e Quality Gate **Passed**.
+
+No lab, o primeiro run resultou em: 8 linhas de código, cobertura 100%, duplicação 0%, Quality Gate **Passed** e **1 issue** de segurança (python:S4502), tratada na Etapa 9.
+
+**Falhas possíveis no primeiro run:**
+
+| Sintoma | Causa provável |
+|---|---|
+| Falha logo no início: action não permitida | Política da org (6.7) |
+| `Unauthorized` ou `401` no scan | Token errado, expirado ou sem permissão; project key divergente (6.2) |
+| Timeout ou `connection refused` no scan | O runner não alcança o Sonar: confira `allowed_cidrs` e se o Sonar está `UP` |
+| Erro no step do scan relacionado à versão da action | Breaking change da v8; teste `@v7` |
+| Job vermelho por Quality Gate | Esperado quando o gate reprova (`sonar.qualitygate.wait=true`) |
 
 ---
 
 ## Etapa 9: Cenário de treinamento (o Sonar apontando problema)
 
-Com o fluxo verde, adicione código ruim de propósito para o grupo ver o gate falhar.
+Com o fluxo verde, adicione código ruim de propósito para ver o gate falhar.
 
 `app/legacy.py`:
 
@@ -765,9 +940,18 @@ def checksum(data: str) -> str:
     return hashlib.md5(data.encode()).hexdigest()  # hash fraco
 ```
 
-Faça commit e push. O Sonar tende a reportar a credencial hardcoded, o `except` genérico, a variável não usada e o uso de MD5. O arquivo também não tem teste, então a cobertura em código novo cai. É provável que o Quality Gate reprove e o job fique vermelho.
+Faça commit e push. O Sonar tende a reportar a credencial hardcoded, o `except` genérico, a variável não usada e o uso de MD5. O arquivo também não tem teste, então a cobertura em código novo cai.
 
-**Exercício para o grupo:** corrigir cada issue ou adicionar testes, dar push e ver o gate voltar para verde.
+**O Quality Gate pode não reprovar.** O resultado depende das condições do gate ativo (aba **Quality gates**; clique em "All conditions passed" no card do projeto para ver o que é avaliado). No primeiro run do lab o gate passou com uma issue de severidade alta aberta, então não conte com o job vermelho sem conferir as condições. Se quiser que o gate falhe de forma previsível (opcional): em **Quality gates**, copie o "Sonar way" (o gate padrão não é editável), adicione uma condição sobre issues em código novo, defina a cópia como padrão do projeto e só depois faça o push do `legacy.py`.
+
+### O achado do Sonar (python:S4502)
+
+O Sonar apontou "Make sure disabling CSRF protection is safe here" na linha 3 do `app/main.py` (`app = Flask(__name__)`). Essa regra dispara em apps Flask sem proteção CSRF configurada. O app só tem dois endpoints GET que devolvem JSON, sem sessão nem escrita, então na prática não é explorável. Para um treinamento é um bom material de triagem:
+
+- **Triagem (recomendo):** na tela da issue, mude o status de Open para Accept ou False Positive, com um comentário justificando. É o fluxo que o time vai usar no dia a dia.
+- **Correção:** habilitar `CSRFProtect` do `flask-wtf`. Mostra o ciclo "issue, correção, issue some", mas adiciona dependência e `SECRET_KEY` a um app que não precisa delas.
+
+**Exercício para o grupo:** triar ou corrigir cada issue (a S4502 e as do `legacy.py`), dar push e ver o Quality Gate voltar para verde.
 
 ---
 
@@ -775,24 +959,28 @@ Faça commit e push. O Sonar tende a reportar a credencial hardcoded, o `except`
 
 ```bash
 # pausar entre sessões de treino (o IP estático reservado continua sendo cobrado enquanto a VM está parada)
-gcloud compute instances stop sonarqube-lab --zone southamerica-east1-b --project tbx-gabriel-simoes
-gcloud compute instances start sonarqube-lab --zone southamerica-east1-b --project tbx-gabriel-simoes
+gcloud compute instances stop sonarqube-lab --zone southamerica-east1-a --project tbx-gabriel-simoes
+gcloud compute instances start sonarqube-lab --zone southamerica-east1-a --project tbx-gabriel-simoes
 
 # destruir tudo ao final
 cd terraform && terraform destroy
 ```
 
-Destruir a VM apaga os dados do Sonar (histórico de análises), porque os volumes ficam no disco de boot. Para o lab isso é aceitável.
+Se você trocou a zona no `terraform.tfvars`, use a mesma zona nos comandos acima.
+
+- **Destruir a VM apaga os dados do Sonar** (histórico de análises), porque os volumes ficam no disco de boot. Para o lab isso é aceitável.
+- **Recriar o lab** (`destroy` e `apply`) gera **novo IP estático** e um Sonar zerado (`admin/admin`, sem token). Refaça a Etapa 6 e atualize os secrets `SONAR_HOST_URL` e `SONAR_TOKEN`.
+- O `terraform destroy` **não** apaga o repositório nem os secrets do GitHub, nem o bucket de state. Remova pela web se não forem mais necessários.
 
 ---
 
-## Mapeamento com o Definition of Done
+## Etapa 11: Mapeamento com o Definition of Done
 
-| Critério | Onde foi atendido |
-|---|---|
-| Criar VM na estrutura do GCP da Toolbox via Terraform | Etapas 4 e 5 (`terraform apply`) |
-| Criar pipeline | Etapa 7 (`ci-sonar.yml`, com build da imagem Hello World) |
-| Executar testes e enviar informações ao SonarQube | Etapas 7 e 8 (pytest com cobertura, scanner e Quality Gate) |
+| Critério | Onde foi atendido | Evidência |
+|---|---|---|
+| Criar VM na estrutura do GCP da Toolbox via Terraform | Etapas 4 e 5 | `terraform apply` criou a VM `sonarqube-lab`; o Sonar responde na `:9000` |
+| Criar pipeline | Etapa 7 | Workflow `ci-sonar` com `test-and-scan` e `docker-build` (imagem Hello World) |
+| Executar testes e envio das informações ao SonarQube | Etapas 7 e 8 | Run verde; projeto `hello-sonar-lab` no Sonar com cobertura 100% e Quality Gate Passed |
 
 ---
 
