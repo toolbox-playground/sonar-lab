@@ -1,6 +1,6 @@
 # SonarQube lab no GCP (Terraform) com GitHub Actions
 
-Cenário de treinamento no projeto GCP `tbx-gabriel-simoes` (Lab Toolbox): VM SonarQube criada via Terraform, app Hello World em Docker e pipeline no GitHub Actions que roda testes e envia o relatório ao SonarQube.
+Cenário de treinamento no projeto GCP: VM SonarQube criada via Terraform, app Hello World em Docker e pipeline no GitHub Actions que roda testes e envia o relatório ao SonarQube.
 
 ## Sumário
 
